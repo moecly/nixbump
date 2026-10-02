@@ -1,6 +1,6 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use std::process::{self, Command};
+use std::process::{self, Command, Stdio};
 
 use clap::Parser;
 use regex::Regex;
@@ -121,6 +121,19 @@ fn run(file: &str, url: &str, version: &str, backup: bool) -> Result<(), String>
     }
 
     run_fmt(file);
+
+    let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    match std::fs::read_to_string(file) {
+        Ok(final_text) => {
+            let d = unified_diff(&text, &final_text, file, color);
+            if d.is_empty() {
+                println!("no changes");
+            } else {
+                print!("{d}");
+            }
+        }
+        Err(e) => println!("warning: cannot read {file} for diff: {e}"),
+    }
     Ok(())
 }
 
@@ -136,56 +149,194 @@ fn run_fmt(file: &str) {
 }
 
 fn prefetch_hash(url: &str) -> Result<String, String> {
-    match Command::new("nix")
-        .args(["store", "prefetch-file", "--json", url])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let json: serde_json::Value = serde_json::from_str(&stdout)
-                .map_err(|e| format!("cannot parse prefetch output: {e}"))?;
-            json.get("hash")
-                .and_then(|h| h.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| "prefetch output missing hash field".into())
+    eprintln!("prefetch: {url}");
+    let child = Command::new("nix")
+        .args(["store", "prefetch-file", "--json", "--hash-type", "sha256", url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("failed to run nix store prefetch-file: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("nix store prefetch-file wait failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "nix store prefetch-file failed (exit {})",
+            output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+        ));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("cannot parse prefetch output: {e}"))?;
+    json.get("hash")
+        .and_then(|h| h.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "prefetch output missing hash field".into())
+}
+
+enum DiffTag {
+    Equal,
+    Delete,
+    Insert,
+}
+
+/// 返回 git 风格 unified diff；无改动时返回空串。
+fn unified_diff(old: &str, new: &str, path: &str, color: bool) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let n = a.len();
+    let m = b.len();
+
+    let mut ops: Vec<(DiffTag, usize)> = Vec::new();
+    if n.saturating_mul(m) > 4_000_000 {
+        for x in 0..n {
+            ops.push((DiffTag::Delete, x));
         }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            if stderr.contains("unknown command") {
-                fallback_hash(url)
-            } else {
-                Err(format!("nix store prefetch-file failed: {}", tail(&stderr)))
+        for y in 0..m {
+            ops.push((DiffTag::Insert, y));
+        }
+    } else {
+        let w = m + 1;
+        let mut dp = vec![0u32; (n + 1) * w];
+        for x in (0..n).rev() {
+            for y in (0..m).rev() {
+                dp[x * w + y] = if a[x] == b[y] {
+                    1 + dp[(x + 1) * w + y + 1]
+                } else {
+                    dp[(x + 1) * w + y].max(dp[x * w + y + 1])
+                };
             }
         }
-        Err(_) => fallback_hash(url),
+        let (mut x, mut y) = (0usize, 0usize);
+        while x < n && y < m {
+            if a[x] == b[y] {
+                ops.push((DiffTag::Equal, x));
+                x += 1;
+                y += 1;
+            } else if dp[(x + 1) * w + y] >= dp[x * w + y + 1] {
+                ops.push((DiffTag::Delete, x));
+                x += 1;
+            } else {
+                ops.push((DiffTag::Insert, y));
+                y += 1;
+            }
+        }
+        while x < n {
+            ops.push((DiffTag::Delete, x));
+            x += 1;
+        }
+        while y < m {
+            ops.push((DiffTag::Insert, y));
+            y += 1;
+        }
     }
+
+    let changes: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, (t, _))| !matches!(t, DiffTag::Equal))
+        .map(|(i, _)| i)
+        .collect();
+    if changes.is_empty() {
+        return String::new();
+    }
+
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    let mut start = changes[0];
+    let mut last = changes[0];
+    for &c in &changes[1..] {
+        if c - last <= 6 {
+            last = c;
+        } else {
+            hunks.push((start, last));
+            start = c;
+            last = c;
+        }
+    }
+    hunks.push((start, last));
+
+    let cyan = |s: &str| -> String {
+        if color {
+            format!("\x1b[36m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    };
+    let paint = |tag: char, line: &str| -> String {
+        match (color, tag) {
+            (true, '-') => format!("\x1b[31m-{line}\x1b[0m"),
+            (true, '+') => format!("\x1b[32m+{line}\x1b[0m"),
+            _ => format!("{tag}{line}"),
+        }
+    };
+
+    let mut out = String::new();
+    let p = path.strip_prefix('/').unwrap_or(path);
+    out.push_str(&cyan(&format!("diff --git a/{p} b/{p}\n")));
+    out.push_str(&cyan(&format!("--- a/{p}\n")));
+    out.push_str(&cyan(&format!("+++ b/{p}\n")));
+
+    for (h_start, h_end) in hunks {
+        let lo = h_start.saturating_sub(3);
+        let hi = (h_end + 4).min(ops.len());
+
+        let old_before: usize = ops[..lo]
+            .iter()
+            .filter(|(t, _)| matches!(t, DiffTag::Equal | DiffTag::Delete))
+            .count();
+        let new_before: usize = ops[..lo]
+            .iter()
+            .filter(|(t, _)| matches!(t, DiffTag::Equal | DiffTag::Insert))
+            .count();
+        let old_count: usize = ops[lo..hi]
+            .iter()
+            .filter(|(t, _)| matches!(t, DiffTag::Equal | DiffTag::Delete))
+            .count();
+        let new_count: usize = ops[lo..hi]
+            .iter()
+            .filter(|(t, _)| matches!(t, DiffTag::Equal | DiffTag::Insert))
+            .count();
+
+        let mut old_start = old_before + 1;
+        let mut new_start = new_before + 1;
+        if old_count == 0 {
+            old_start -= 1;
+        }
+        if new_count == 0 {
+            new_start -= 1;
+        }
+
+        out.push_str(&cyan(&format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+        )));
+
+        for (tag, idx) in &ops[lo..hi] {
+            match tag {
+                DiffTag::Equal => out.push_str(&paint(' ', a[*idx])),
+                DiffTag::Delete => out.push_str(&paint('-', a[*idx])),
+                DiffTag::Insert => out.push_str(&paint('+', b[*idx])),
+            }
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
-fn fallback_hash(url: &str) -> Result<String, String> {
-    let o = Command::new("nix-prefetch-url")
-        .args(["--type", "sha256", url])
-        .output()
-        .map_err(|e| format!("nix-prefetch-url failed to run: {e}"))?;
-    if !o.status.success() {
-        return Err(format!(
-            "nix-prefetch-url failed: {}",
-            tail(&String::from_utf8_lossy(&o.stderr))
-        ));
-    }
-    let hex = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    let c = Command::new("nix")
-        .args(["hash", "convert", "--hash-algo", "sha256", "--to", "sri", &hex])
-        .output()
-        .map_err(|e| format!("nix hash convert failed to run: {e}"))?;
-    if !c.status.success() {
-        return Err(format!(
-            "nix hash convert failed: {}",
-            tail(&String::from_utf8_lossy(&c.stderr))
-        ));
-    }
-    Ok(String::from_utf8_lossy(&c.stdout).trim().to_string())
-}
+#[cfg(test)]
+mod tests {
+    use super::unified_diff;
 
-fn tail(s: &str) -> String {
-    s.lines().last().unwrap_or("").to_string()
+    #[test]
+    fn single_line_change() {
+        let d = unified_diff("a\nb\nc\nd\ne\n", "a\nB\nc\nd\ne\n", "f", false);
+        assert_eq!(
+            d,
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,5 +1,5 @@\n a\n-b\n+B\n c\n d\n e\n"
+        );
+    }
+
+    #[test]
+    fn identical_yields_empty() {
+        assert_eq!(unified_diff("a\n", "a\n", "f", false), "");
+    }
 }
