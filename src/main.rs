@@ -50,6 +50,18 @@ fn prompt(label: &str) -> String {
     v
 }
 
+/// 交互确认，默认 No（回车/EOF 视为拒绝）。
+fn confirm(label: &str) -> bool {
+    let mut err = io::stderr();
+    write!(err, "{label} [y/N] ").unwrap();
+    err.flush().unwrap();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 fn run(file: &str, url: &str, version: &str, backup: bool) -> Result<(), String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("url must start with http:// or https://: {url}"));
@@ -106,11 +118,7 @@ fn run(file: &str, url: &str, version: &str, backup: bool) -> Result<(), String>
         })
         .into_owned();
 
-    if backup {
-        let bak = Path::new(file).with_extension("nix.bak");
-        std::fs::copy(file, &bak).map_err(|e| format!("cannot write backup {bak:?}: {e}"))?;
-    }
-    std::fs::write(file, new_text.as_bytes()).map_err(|e| format!("cannot write {file}: {e}"))?;
+    let final_text = fmt_text(file, &new_text);
 
     println!("file: {file}");
     println!("version: {old_version} -> {version}");
@@ -120,32 +128,64 @@ fn run(file: &str, url: &str, version: &str, backup: bool) -> Result<(), String>
         println!("warning: multiple matches, only first updated");
     }
 
-    run_fmt(file);
-
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    match std::fs::read_to_string(file) {
-        Ok(final_text) => {
-            let d = unified_diff(&text, &final_text, file, color);
-            if d.is_empty() {
-                println!("no changes");
-            } else {
-                print!("{d}");
-            }
-        }
-        Err(e) => println!("warning: cannot read {file} for diff: {e}"),
+    let diff = unified_diff(&text, &final_text, file, color);
+    if diff.is_empty() {
+        println!("no changes");
+        return Ok(());
     }
+    print!("{diff}");
+
+    if !confirm("apply patch?") {
+        println!("aborted, {file} unchanged");
+        return Ok(());
+    }
+
+    if backup {
+        let bak = Path::new(file).with_extension("nix.bak");
+        std::fs::copy(file, &bak).map_err(|e| format!("cannot write backup {bak:?}: {e}"))?;
+    }
+    std::fs::write(file, final_text.as_bytes()).map_err(|e| format!("cannot write {file}: {e}"))?;
+    println!("written: {file}");
     Ok(())
 }
 
-fn run_fmt(file: &str) {
-    match Command::new("nixfmt").arg(file).status() {
-        Ok(s) if s.success() => println!("fmt: ok"),
-        Ok(s) => println!(
-            "warning: nixfmt failed: exit {}",
-            s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
-        ),
-        Err(e) => println!("warning: nixfmt failed: {e}"),
+/// 用目标文件所在项目 flake 的 formatter 格式化（`nix fmt`），与项目既有风格一致。
+/// 失败时原样返回未格式化的文本。
+fn fmt_text(file: &str, text: &str) -> String {
+    let dir = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp = std::env::temp_dir().join(format!("nixbump-{}.nix", process::id()));
+    if let Err(e) = std::fs::write(&tmp, text) {
+        println!("warning: fmt skipped: cannot write temp file: {e}");
+        return text.to_string();
     }
+
+    let mut cmd = Command::new("nix");
+    cmd.args(["fmt", "--quiet"]).arg(&tmp);
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    let result = match cmd.output() {
+        Ok(o) if o.status.success() => std::fs::read_to_string(&tmp).unwrap_or_else(|_| text.to_string()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stderr = stderr.trim();
+            println!(
+                "warning: nix fmt failed (exit {}): {stderr}",
+                o.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+            );
+            text.to_string()
+        }
+        Err(e) => {
+            println!("warning: cannot run nix fmt: {e}");
+            text.to_string()
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    if result != text {
+        println!("fmt: ok");
+    }
+    result
 }
 
 fn prefetch_hash(url: &str) -> Result<String, String> {
